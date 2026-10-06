@@ -1,4 +1,5 @@
 import requests
+import json
 from datetime import datetime, timezone
 
 BASE = "https://api.elections.kalshi.com/trade-api/v2"
@@ -10,9 +11,9 @@ def get_json(url, params=None):
     return r.json()
 
 
-# ==================================================
-# 1. FIND CURRENT ETH 15-MINUTE KALSHI MARKET
-# ==================================================
+# =========================
+# FIND CURRENT KALSHI MARKET
+# =========================
 
 data = get_json(
     BASE + "/markets",
@@ -26,7 +27,7 @@ data = get_json(
 markets = data.get("markets", [])
 
 if not markets:
-    raise Exception("No open KXETH15M markets found.")
+    raise Exception("No open ETH 15-minute markets found.")
 
 markets.sort(key=lambda x: x.get("close_time", ""))
 
@@ -34,70 +35,86 @@ market = markets[0]
 
 ticker = market["ticker"]
 title = market.get("title", "")
-
 close_time = market.get("close_time")
 
 floor_strike = market.get("floor_strike")
 cap_strike = market.get("cap_strike")
 
 
-# ==================================================
-# 2. GET KALSHI ORDER BOOK
-# ==================================================
+# =========================
+# GET KALSHI ORDER BOOK
+# =========================
 
-book = get_json(
-    BASE + f"/markets/{ticker}/orderbook"
-)
+book = get_json(BASE + f"/markets/{ticker}/orderbook")
+
+print("\nRAW ORDER BOOK:")
+print(json.dumps(book, indent=2))
+
+
+# =========================
+# PARSE ORDER BOOK
+# =========================
 
 orderbook = book.get("orderbook", {})
 
-yes_bids = orderbook.get("yes", [])
-no_bids = orderbook.get("no", [])
 
-
-def best_price(side):
-    if not side:
-        return None
-
+def extract_prices(data):
     prices = []
 
-    for item in side:
-        if isinstance(item, list):
-            prices.append(item[0])
-        elif isinstance(item, dict):
-            if "price" in item:
-                prices.append(item["price"])
+    if isinstance(data, list):
+        for item in data:
 
-    if not prices:
-        return None
+            if isinstance(item, list) and len(item) >= 1:
+                try:
+                    prices.append(float(item[0]))
+                except:
+                    pass
 
-    return max(prices)
+            elif isinstance(item, dict):
+
+                for key in [
+                    "price",
+                    "price_cents",
+                    "yes_price",
+                    "no_price"
+                ]:
+                    if key in item:
+                        try:
+                            prices.append(float(item[key]))
+                            break
+                        except:
+                            pass
+
+    return prices
 
 
-yes_bid = best_price(yes_bids)
-no_bid = best_price(no_bids)
+yes_data = orderbook.get("yes", [])
+no_data = orderbook.get("no", [])
+
+yes_prices = extract_prices(yes_data)
+no_prices = extract_prices(no_data)
+
+yes_bid = max(yes_prices) if yes_prices else None
+no_bid = max(no_prices) if no_prices else None
 
 
-# ==================================================
-# 3. CURRENT ETH PRICE
-# ==================================================
+# =========================
+# ETH PRICE
+# =========================
 
-kraken = get_json(
+eth_data = get_json(
     "https://api.kraken.com/0/public/Ticker",
     {"pair": "ETHUSD"}
 )
 
-if kraken.get("error"):
-    raise Exception(f"Kraken error: {kraken['error']}")
-
-pair_data = list(kraken["result"].values())[0]
-
-eth_price = float(pair_data["c"][0])
+eth_price = float(
+    eth_data["result"]["XETHZUSD"]["c"][0]
+)
 
 
-# ==================================================
-# 4. ETH 1-MINUTE CANDLES
-# ==================================================
+# =========================
+# KRAKEN 1-MINUTE DATA
+# =========================
 
 ohlc = get_json(
     "https://api.kraken.com/0/public/OHLC",
@@ -107,237 +124,124 @@ ohlc = get_json(
     }
 )
 
-if ohlc.get("error"):
-    raise Exception(f"Kraken error: {ohlc['error']}")
+candles = ohlc["result"]["XETHZUSD"]
 
-candles = list(ohlc["result"].values())[0]
-
-candles = candles[:-1]
-
-if len(candles) < 60:
-    raise Exception("Not enough ETH candle data.")
-
-closes = [float(x[4]) for x in candles]
+closes = [float(c[4]) for c in candles]
 
 
-# ==================================================
-# 5. MOMENTUM
-# ==================================================
+def momentum(minutes):
+    if len(closes) <= minutes:
+        return 0
 
-price_now = closes[-1]
+    old = closes[-minutes - 1]
+    new = closes[-1]
 
-price_5m = closes[-5]
-
-price_15m = closes[-15]
-
-price_60m = closes[-60]
-
-mom_5m = (price_now / price_5m - 1) * 100
-
-mom_15m = (price_now / price_15m - 1) * 100
-
-mom_60m = (price_now / price_60m - 1) * 100
+    return ((new - old) / old) * 100
 
 
-# ==================================================
-# 6. VOLATILITY
-# ==================================================
+m5 = momentum(5)
+m15 = momentum(15)
+m60 = momentum(60)
+
+
+# =========================
+# VOLATILITY
+# =========================
 
 recent = closes[-15:]
 
-high = max(recent)
+returns = []
 
-low = min(recent)
+for i in range(1, len(recent)):
+    returns.append(
+        (recent[i] - recent[i - 1]) /
+        recent[i - 1]
+    )
 
-volatility = (high - low) / price_now * 100
+if returns:
+    avg = sum(returns) / len(returns)
 
+    variance = sum(
+        (x - avg) ** 2 for x in returns
+    ) / len(returns)
 
-# ==================================================
-# 7. DISTANCE FROM TARGET
-# ==================================================
-
-if floor_strike is not None:
-
-    target = float(floor_strike)
-
-    distance = (eth_price - target) / target * 100
+    volatility = (variance ** 0.5) * 100
 
 else:
-
-    target = None
-    distance = None
+    volatility = 0
 
 
-# ==================================================
-# 8. DIRECTION SCORE
-# ==================================================
+# =========================
+# SIMPLE DIRECTION MODEL
+# =========================
 
 score = 0
 
-
-if mom_5m > 0.02:
+if m5 > 0.02:
     score += 1
-
-elif mom_5m < -0.02:
+elif m5 < -0.02:
     score -= 1
 
-
-if mom_15m > 0.04:
+if m15 > 0.04:
     score += 1
-
-elif mom_15m < -0.04:
+elif m15 < -0.04:
     score -= 1
 
-
-if mom_60m > 0.10:
+if m60 > 0.10:
     score += 1
-
-elif mom_60m < -0.10:
+elif m60 < -0.10:
     score -= 1
 
-
-# ==================================================
-# 9. MODEL PROBABILITY
-# ==================================================
 
 if score >= 3:
-
-    prediction = "UP"
-    probability = 0.70
+    prediction = "YES"
+    probability = 70
 
 elif score == 2:
-
-    prediction = "UP"
-    probability = 0.62
+    prediction = "YES"
+    probability = 62
 
 elif score <= -3:
-
-    prediction = "DOWN"
-    probability = 0.70
+    prediction = "NO"
+    probability = 70
 
 elif score == -2:
-
-    prediction = "DOWN"
-    probability = 0.62
+    prediction = "NO"
+    probability = 62
 
 else:
-
     prediction = "SKIP"
-    probability = 0.50
+    probability = 50
 
 
-# ==================================================
-# 10. MARKET PRICE
-# ==================================================
+# =========================
+# OUTPUT
+# =========================
 
-def cents(value):
-
-    if value is None:
-        return None
-
-    return float(value) / 100
-
-
-yes_probability = cents(yes_bid)
-
-no_probability = cents(no_bid)
-
-
-# ==================================================
-# 11. EDGE CALCULATION
-# ==================================================
-
-if prediction == "UP" and yes_probability is not None:
-
-    edge = probability - yes_probability
-
-    if edge >= 0.08:
-        action = "BUY UP"
-
-    else:
-        action = "SKIP"
-
-
-elif prediction == "DOWN" and no_probability is not None:
-
-    edge = probability - no_probability
-
-    if edge >= 0.08:
-        action = "BUY DOWN"
-
-    else:
-        action = "SKIP"
-
-
-else:
-
-    edge = None
-    action = "SKIP"
-
-
-# ==================================================
-# 12. OUTPUT
-# ==================================================
-
-print("")
-print("==============================================")
+print("\n==============================================")
 print("          ETH 15-MIN KALSHI BOT")
 print("==============================================")
 
 print(f"MARKET: {ticker}")
-
 print(f"TITLE: {title}")
 
-print("")
+print(f"\nETH PRICE: ${eth_price:,.2f}")
 
-print(f"ETH PRICE: ${eth_price:,.2f}")
+if floor_strike:
+    print(f"TARGET: ${float(floor_strike):,.2f}")
 
-if target is not None:
+print(f"\n5-MIN MOMENTUM:  {m5:+.3f}%")
+print(f"15-MIN MOMENTUM: {m15:+.3f}%")
+print(f"1-HOUR MOMENTUM: {m60:+.3f}%")
 
-    print(f"TARGET: ${target:,.2f}")
+print(f"\nVOLATILITY: {volatility:.3f}%")
 
-    print(f"DISTANCE: {distance:+.3f}%")
-
-print("")
-
-print(f"5-MIN MOMENTUM:  {mom_5m:+.3f}%")
-
-print(f"15-MIN MOMENTUM: {mom_15m:+.3f}%")
-
-print(f"1-HOUR MOMENTUM: {mom_60m:+.3f}%")
-
-print("")
-
-print(f"VOLATILITY: {volatility:.3f}%")
-
-print("")
-
-print(f"KALSHI YES BID: {yes_bid}")
-
+print(f"\nKALSHI YES BID: {yes_bid}")
 print(f"KALSHI NO BID:  {no_bid}")
 
-print("")
+print(f"\nMODEL: {prediction}")
+print(f"MODEL PROBABILITY: {probability}%")
 
-print(f"MODEL: {prediction}")
+print(f"\nCLOSE: {close_time}")
 
-print(f"MODEL PROBABILITY: {probability * 100:.0f}%")
-
-if edge is not None:
-
-    print(f"EDGE: {edge * 100:+.1f}%")
-
-print("")
-
-print(f"FINAL ACTION: {action}")
-
-print("")
-
-print(f"CLOSE: {close_time}")
-
-print("==============================================")
-
-print(
-    f"TIME: {datetime.now(timezone.utc).isoformat()}"
-)
-
-print("==============================================")
+print("\n==============================================")
