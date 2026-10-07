@@ -1,5 +1,4 @@
 import requests
-import json
 from datetime import datetime, timezone
 
 BASE = "https://api.elections.kalshi.com/trade-api/v2"
@@ -27,7 +26,7 @@ data = get_json(
 markets = data.get("markets", [])
 
 if not markets:
-    raise Exception("No open ETH 15-minute markets found.")
+    raise Exception("No open KXETH15M markets found.")
 
 markets.sort(key=lambda x: x.get("close_time", ""))
 
@@ -36,9 +35,7 @@ market = markets[0]
 ticker = market["ticker"]
 title = market.get("title", "")
 close_time = market.get("close_time")
-
 floor_strike = market.get("floor_strike")
-cap_strike = market.get("cap_strike")
 
 
 # =========================
@@ -47,55 +44,33 @@ cap_strike = market.get("cap_strike")
 
 book = get_json(BASE + f"/markets/{ticker}/orderbook")
 
-print("\nRAW ORDER BOOK:")
-print(json.dumps(book, indent=2))
+orderbook = book.get("orderbook_fp", {})
+
+yes_data = orderbook.get("yes_dollars", [])
+no_data = orderbook.get("no_dollars", [])
 
 
-# =========================
-# PARSE ORDER BOOK
-# =========================
+def best_bid(data):
+    if not data:
+        return None
 
-orderbook = book.get("orderbook", {})
-
-
-def extract_prices(data):
     prices = []
 
-    if isinstance(data, list):
-        for item in data:
+    for item in data:
+        if isinstance(item, list) and len(item) >= 1:
+            try:
+                prices.append(float(item[0]))
+            except:
+                pass
 
-            if isinstance(item, list) and len(item) >= 1:
-                try:
-                    prices.append(float(item[0]))
-                except:
-                    pass
+    if not prices:
+        return None
 
-            elif isinstance(item, dict):
-
-                for key in [
-                    "price",
-                    "price_cents",
-                    "yes_price",
-                    "no_price"
-                ]:
-                    if key in item:
-                        try:
-                            prices.append(float(item[key]))
-                            break
-                        except:
-                            pass
-
-    return prices
+    return max(prices)
 
 
-yes_data = orderbook.get("yes", [])
-no_data = orderbook.get("no", [])
-
-yes_prices = extract_prices(yes_data)
-no_prices = extract_prices(no_data)
-
-yes_bid = max(yes_prices) if yes_prices else None
-no_bid = max(no_prices) if no_prices else None
+yes_bid = best_bid(yes_data)
+no_bid = best_bid(no_data)
 
 
 # =========================
@@ -166,13 +141,12 @@ if returns:
     ) / len(returns)
 
     volatility = (variance ** 0.5) * 100
-
 else:
     volatility = 0
 
 
 # =========================
-# SIMPLE DIRECTION MODEL
+# DIRECTION MODEL
 # =========================
 
 score = 0
@@ -236,8 +210,9 @@ print(f"1-HOUR MOMENTUM: {m60:+.3f}%")
 
 print(f"\nVOLATILITY: {volatility:.3f}%")
 
-print(f"\nKALSHI YES BID: {yes_bid}")
-print(f"KALSHI NO BID:  {no_bid}")
+print("\nKALSHI ORDER BOOK")
+print(f"YES BID: {yes_bid}")
+print(f"NO BID:  {no_bid}")
 
 print(f"\nMODEL: {prediction}")
 print(f"MODEL PROBABILITY: {probability}%")
