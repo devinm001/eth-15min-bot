@@ -1,7 +1,9 @@
 import requests
+import os
 from datetime import datetime, timezone
 
 BASE = "https://api.elections.kalshi.com/trade-api/v2"
+STATE_FILE = "bot_state.txt"
 
 
 def get_json(url, params=None):
@@ -11,7 +13,7 @@ def get_json(url, params=None):
 
 
 # =========================
-# FIND CURRENT KALSHI MARKET
+# FIND CURRENT MARKET
 # =========================
 
 data = get_json(
@@ -39,7 +41,7 @@ floor_strike = market.get("floor_strike")
 
 
 # =========================
-# GET KALSHI ORDER BOOK
+# KALSHI ORDER BOOK
 # =========================
 
 book = get_json(BASE + f"/markets/{ticker}/orderbook")
@@ -47,7 +49,7 @@ book = get_json(BASE + f"/markets/{ticker}/orderbook")
 orderbook = book.get("orderbook_fp", {})
 
 yes_data = orderbook.get("yes_dollars", [])
-no_data = orderbook.get("no_dollars", [])
+no_data = orderbook.get("no_dollars")
 
 
 def best_bid(data):
@@ -63,10 +65,7 @@ def best_bid(data):
             except:
                 pass
 
-    if not prices:
-        return None
-
-    return max(prices)
+    return max(prices) if prices else None
 
 
 yes_bid = best_bid(yes_data)
@@ -88,7 +87,7 @@ eth_price = float(
 
 
 # =========================
-# KRAKEN 1-MINUTE DATA
+# ETH MOMENTUM
 # =========================
 
 ohlc = get_json(
@@ -146,7 +145,7 @@ else:
 
 
 # =========================
-# DIRECTION MODEL
+# MODEL
 # =========================
 
 score = 0
@@ -189,6 +188,61 @@ else:
 
 
 # =========================
+# EDGE
+# =========================
+
+market_price = None
+edge = None
+
+if prediction == "YES" and yes_bid is not None:
+    market_price = yes_bid
+    edge = probability / 100 - yes_bid
+
+elif prediction == "NO" and no_bid is not None:
+    market_price = no_bid
+    edge = probability / 100 - no_bid
+
+
+# =========================
+# FLIP DETECTION
+# =========================
+
+previous_prediction = None
+previous_ticker = None
+
+if os.path.exists(STATE_FILE):
+
+    with open(STATE_FILE, "r") as f:
+        lines = f.read().split("|")
+
+        if len(lines) >= 2:
+            previous_ticker = lines[0]
+            previous_prediction = lines[1]
+
+
+if previous_ticker == ticker:
+
+    if (
+        previous_prediction in ["YES", "NO"]
+        and prediction in ["YES", "NO"]
+        and previous_prediction != prediction
+    ):
+        flip = f"FLIP: {previous_prediction} -> {prediction}"
+
+    else:
+        flip = "NO FLIP"
+
+else:
+    flip = "NEW MARKET"
+
+
+# Save current state
+
+with open(STATE_FILE, "w") as f:
+    f.write(f"{ticker}|{prediction}")
+
+
+# =========================
 # OUTPUT
 # =========================
 
@@ -210,12 +264,21 @@ print(f"1-HOUR MOMENTUM: {m60:+.3f}%")
 
 print(f"\nVOLATILITY: {volatility:.3f}%")
 
-print("\nKALSHI ORDER BOOK")
+print("\nKALSHI MARKET")
 print(f"YES BID: {yes_bid}")
 print(f"NO BID:  {no_bid}")
 
-print(f"\nMODEL: {prediction}")
-print(f"MODEL PROBABILITY: {probability}%")
+print("\nMODEL")
+print(f"PREDICTION: {prediction}")
+print(f"PROBABILITY: {probability}%")
+
+if market_price is not None:
+    print(f"MARKET PRICE: ${market_price:.2f}")
+
+if edge is not None:
+    print(f"EDGE: {edge * 100:+.1f} percentage points")
+
+print(f"\n{flip}")
 
 print(f"\nCLOSE: {close_time}")
 
